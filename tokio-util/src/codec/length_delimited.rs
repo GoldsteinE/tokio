@@ -573,10 +573,10 @@ impl Decoder for LengthDelimitedCodec {
     }
 }
 
-impl Encoder<Bytes> for LengthDelimitedCodec {
+impl<'a> Encoder<&'a [u8]> for LengthDelimitedCodec {
     type Error = io::Error;
 
-    fn encode(&mut self, data: Bytes, dst: &mut BytesMut) -> Result<(), io::Error> {
+    fn encode(&mut self, data: &'a [u8], dst: &mut BytesMut) -> Result<(), io::Error> {
         let n = data.len();
 
         if n > self.builder.max_frame_len {
@@ -611,7 +611,7 @@ impl Encoder<Bytes> for LengthDelimitedCodec {
         }
 
         // Write the frame to the buffer
-        dst.extend_from_slice(&data[..]);
+        dst.extend_from_slice(data);
 
         Ok(())
     }
