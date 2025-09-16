@@ -140,8 +140,8 @@ impl<T> Local<T> {
     /// # Panics
     ///
     /// The method panics if there is not enough capacity to fit in the queue.
-    pub(crate) fn push_back(&mut self, tasks: impl ExactSizeIterator<Item = task::Notified<T>>) {
-        let len = tasks.len();
+    pub(crate) fn push_back(&mut self, tasks: impl Iterator<Item = task::Notified<T>>) {
+        let len = tasks.size_hint().1.expect("must have an upper bound");
         assert!(len <= LOCAL_QUEUE_CAPACITY);
 
         if len == 0 {
@@ -163,7 +163,10 @@ impl<T> Local<T> {
             panic!()
         }
 
+        let mut actual_len = 0;
         for task in tasks {
+            actual_len += 1;
+            assert!(actual_len <= len, "overflow!!");
             let idx = tail as usize & MASK;
 
             self.inner.buffer[idx].with_mut(|ptr| {

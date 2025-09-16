@@ -18,6 +18,7 @@ mod schedule;
 mod shutdown;
 mod task;
 pub(crate) use task::BlockingTask;
+pub(crate) use schedule::BlockingSchedule;
 
 use crate::runtime::Builder;
 

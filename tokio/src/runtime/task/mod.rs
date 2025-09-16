@@ -184,7 +184,7 @@
 
 mod core;
 use self::core::Cell;
-use self::core::Header;
+pub(crate) use self::core::Header;
 
 mod error;
 pub use self::error::JoinError;
