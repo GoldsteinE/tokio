@@ -26,7 +26,19 @@ pub(crate) struct Inject<T: 'static> {
 
     pub(super) queue: MpscQueue<Header>,
 
+    // Needs to be _after_ the queue (so it's dropped later).
+    // We don't use a real `Box<_>` here, because it has additional
+    // aliasing requirements and we just need a deallocation.
+    _dealloc_dummy: DeallocDummy,
     _phantom: PhantomData<T>,
+}
+
+struct DeallocDummy(*mut Header);
+
+impl Drop for DeallocDummy {
+    fn drop(&mut self) {
+        drop(unsafe { Box::from_raw(self.0) });
+    }
 }
 
 // trust me bro
@@ -36,24 +48,18 @@ unsafe impl<T: 'static> Sync for Inject<T> {}
 impl<T: 'static> Inject<T> {
     pub(crate) fn new() -> Inject<T> {
         // FIXME: leaks memory
-        let stub = unsafe {
+        let (stub, _dealloc_dummy) = unsafe {
             let ptr = Box::into_raw(Box::new(Header::evil_unusable_dummy_header()));
-            #[cfg(miri)]
-            {
-                extern "Rust" {
-                    pub fn miri_static_root(ptr: *const u8);
-                }
-
-                unsafe {
-                    miri_static_root(ptr.cast::<u8>().cast_const());
-                }
-            }
-            RawTask::from_raw(NonNull::new_unchecked(ptr))
+            (
+                RawTask::from_raw(NonNull::new_unchecked(ptr)),
+                DeallocDummy(ptr),
+            )
         };
         Inject {
             is_closed: AtomicBool::new(false),
             len: AtomicUsize::new(0),
             queue: MpscQueue::new_with_stub(stub),
+            _dealloc_dummy,
             _phantom: PhantomData,
         }
     }
