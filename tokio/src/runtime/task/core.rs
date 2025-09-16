@@ -17,6 +17,7 @@ use crate::runtime::task::state::State;
 use crate::runtime::task::{Id, Schedule, TaskHarnessScheduleHooks};
 use crate::util::linked_list;
 
+use std::mem::offset_of;
 use std::num::NonZeroU64;
 #[cfg(tokio_unstable)]
 use std::panic::Location;
@@ -160,8 +161,7 @@ pub(crate) struct Header {
     /// Task state.
     pub(super) state: State,
 
-    /// Pointer to next task, used with the injection queue.
-    pub(super) queue_next: UnsafeCell<Option<NonNull<Header>>>,
+    links: cordyceps::mpsc_queue::Links<Header>,
 
     /// Table of function pointers for executing actions on the task.
     pub(super) vtable: &'static Vtable,
@@ -184,8 +184,45 @@ pub(crate) struct Header {
     pub(super) tracing_id: Option<tracing::Id>,
 }
 
+impl Header {
+    pub(crate) unsafe fn evil_unusable_dummy_header() -> Self {
+        Self {
+            state: State::new(),
+            links: cordyceps::mpsc_queue::Links::new(),
+            vtable: crate::runtime::task::raw::vtable::<
+                std::future::Pending<()>,
+                crate::runtime::blocking::BlockingSchedule,
+            >(),
+            owner_id: UnsafeCell::new(None),
+            #[cfg(all(tokio_unstable, feature = "tracing"))]
+            tracing_id: None,
+        }
+    }
+}
+
 unsafe impl Send for Header {}
 unsafe impl Sync for Header {}
+
+unsafe impl cordyceps::Linked<cordyceps::mpsc_queue::Links<Header>> for Header {
+    type Handle = raw::RawTask;
+
+    fn into_ptr(r: Self::Handle) -> NonNull<Self> {
+        r.header_ptr()
+    }
+
+    unsafe fn from_ptr(ptr: NonNull<Self>) -> Self::Handle {
+        Self::Handle::from_raw(ptr)
+    }
+
+    unsafe fn links(ptr: NonNull<Self>) -> NonNull<cordyceps::mpsc_queue::Links<Header>> {
+        NonNull::new_unchecked(
+            ptr.as_ptr()
+                .cast::<u8>()
+                .wrapping_add(offset_of!(Header, links))
+                .cast(),
+        )
+    }
+}
 
 /// Cold data is stored after the future. Data is considered cold if it is only
 /// used during creation or shutdown of the task.
@@ -232,7 +269,7 @@ impl<T: Future, S: Schedule> Cell<T, S> {
         ) -> Header {
             Header {
                 state,
-                queue_next: UnsafeCell::new(None),
+                links: cordyceps::mpsc_queue::Links::new(),
                 vtable,
                 owner_id: UnsafeCell::new(None),
                 #[cfg(all(tokio_unstable, feature = "tracing"))]
@@ -421,10 +458,6 @@ impl<T: Future, S: Schedule> Core<T, S> {
 }
 
 impl Header {
-    pub(super) unsafe fn set_next(&self, next: Option<NonNull<Header>>) {
-        self.queue_next.with_mut(|ptr| *ptr = next);
-    }
-
     // safety: The caller must guarantee exclusive access to this field, and
     // must ensure that the id is either `None` or the id of the OwnedTasks
     // containing this task.

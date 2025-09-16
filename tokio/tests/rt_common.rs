@@ -97,8 +97,10 @@ rt_test! {
 
         let mut win = false;
         rt.block_on(async {
+            println!("here");
             win = true;
         });
+        println!("win: {win}");
 
         assert!(win);
     }

@@ -61,7 +61,7 @@ use crate::runtime;
 use crate::runtime::scheduler::multi_thread::{
     idle, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker,
 };
-use crate::runtime::scheduler::{inject, Defer, Lock};
+use crate::runtime::scheduler::{inject, Defer, Inject};
 use crate::runtime::task::OwnedTasks;
 use crate::runtime::{blocking, driver, scheduler, task, Config, SchedulerMetrics, WorkerMetrics};
 use crate::runtime::{context, TaskHooks};
@@ -150,7 +150,7 @@ pub(crate) struct Shared {
     /// Global task queue used for:
     ///  1. Submit work to the scheduler while **not** currently on a worker thread.
     ///  2. Submit work to the scheduler when a worker run queue is saturated
-    pub(super) inject: inject::Shared<Arc<Handle>>,
+    pub(super) inject: inject::Inject<Arc<Handle>>,
 
     /// Coordinates idle workers
     idle: Idle,
@@ -190,9 +190,6 @@ pub(crate) struct Shared {
 pub(crate) struct Synced {
     /// Synchronized state for `Idle`.
     pub(super) idle: idle::Synced,
-
-    /// Synchronized state for `Inject`.
-    pub(crate) inject: inject::Synced,
 }
 
 /// Used to communicate with a worker from other threads.
@@ -274,7 +271,7 @@ pub(super) fn create(
     }
 
     let (idle, idle_synced) = Idle::new(size);
-    let (inject, inject_synced) = inject::Shared::new();
+    let inject = Inject::new();
 
     let remotes_len = remotes.len();
     let handle = Arc::new(Handle {
@@ -284,10 +281,7 @@ pub(super) fn create(
             inject,
             idle,
             owned: OwnedTasks::new(size),
-            synced: Mutex::new(Synced {
-                idle: idle_synced,
-                inject: inject_synced,
-            }),
+            synced: Mutex::new(Synced { idle: idle_synced }),
             shutdown_cores: Mutex::new(vec![]),
             trace_status: TraceStatus::new(remotes_len),
             config,
@@ -466,7 +460,6 @@ fn run(worker: Arc<Worker>) {
     impl Drop for AbortOnPanic {
         fn drop(&mut self) {
             if std::thread::panicking() {
-                eprintln!("worker thread panicking; aborting process");
                 std::process::abort();
             }
         }
@@ -842,10 +835,7 @@ impl Core {
             // Take at least one task since the first task is returned directly
             // and not pushed onto the local queue.
             let n = usize::max(1, n);
-
-            let mut synced = worker.handle.shared.synced.lock();
-            // safety: passing in the correct `inject::Synced`.
-            let mut tasks = unsafe { worker.inject().pop_n(&mut synced.inject, n) };
+            let mut tasks = worker.inject().pop_n(n);
 
             // Pop the first task to return immediately
             let ret = tasks.next();
@@ -993,8 +983,7 @@ impl Core {
 
         if !self.is_shutdown {
             // Check if the scheduler has been shutdown
-            let synced = worker.handle.shared.synced.lock();
-            self.is_shutdown = worker.inject().is_closed(&synced.inject);
+            self.is_shutdown = worker.inject().is_closed();
         }
 
         if !self.is_traced {
@@ -1046,7 +1035,7 @@ impl Core {
 
 impl Worker {
     /// Returns a reference to the scheduler's injection queue.
-    fn inject(&self) -> &inject::Shared<Arc<Handle>> {
+    fn inject(&self) -> &Inject<Arc<Handle>> {
         &self.handle.shared.inject
     }
 }
@@ -1116,27 +1105,17 @@ impl Handle {
             return None;
         }
 
-        let mut synced = self.shared.synced.lock();
-        // safety: passing in correct `idle::Synced`
-        unsafe { self.shared.inject.pop(&mut synced.inject) }
+        self.shared.inject.pop()
     }
 
     fn push_remote_task(&self, task: Notified) {
         self.shared.scheduler_metrics.inc_remote_schedule_count();
 
-        let mut synced = self.shared.synced.lock();
-        // safety: passing in correct `idle::Synced`
-        unsafe {
-            self.shared.inject.push(&mut synced.inject, task);
-        }
+        self.shared.inject.push(task);
     }
 
     pub(super) fn close(&self) {
-        if self
-            .shared
-            .inject
-            .close(&mut self.shared.synced.lock().inject)
-        {
+        if self.shared.inject.close() {
             self.notify_all();
         }
     }
@@ -1223,28 +1202,8 @@ impl Overflow<Arc<Handle>> for Handle {
     where
         I: Iterator<Item = task::Notified<Arc<Handle>>>,
     {
-        unsafe {
-            self.shared.inject.push_batch(self, iter);
-        }
-    }
-}
-
-pub(crate) struct InjectGuard<'a> {
-    lock: crate::loom::sync::MutexGuard<'a, Synced>,
-}
-
-impl<'a> AsMut<inject::Synced> for InjectGuard<'a> {
-    fn as_mut(&mut self) -> &mut inject::Synced {
-        &mut self.lock.inject
-    }
-}
-
-impl<'a> Lock<inject::Synced> for &'a Handle {
-    type Handle = InjectGuard<'a>;
-
-    fn lock(self) -> Self::Handle {
-        InjectGuard {
-            lock: self.shared.synced.lock(),
+        for item in iter {
+            self.shared.inject.push(item);
         }
     }
 }

@@ -1,4 +1,4 @@
-use super::{Pop, Synced};
+use super::Synced;
 
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::runtime::task;

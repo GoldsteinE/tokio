@@ -1,70 +1,132 @@
 //! Inject queue used to send wakeups to a work-stealing scheduler
 
-use crate::loom::sync::Mutex;
-use crate::runtime::task;
+use std::iter::FusedIterator;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 
-mod pop;
-pub(crate) use pop::Pop;
+use crate::loom::sync::atomic::{self, AtomicBool, AtomicUsize};
+use crate::runtime::task::{self, Header, RawTask};
 
-mod shared;
-pub(crate) use shared::Shared;
+use cordyceps::MpscQueue;
 
-mod synced;
-pub(crate) use synced::Synced;
-
-cfg_rt_multi_thread! {
-    mod rt_multi_thread;
-}
+// mod shared;
+// pub(crate) use shared::Shared;
+//
+// mod synced;
+// pub(crate) use synced::Synced;
 
 mod metrics;
 
 /// Growable, MPMC queue used to inject new tasks into the scheduler and as an
 /// overflow queue when the local, fixed-size, array queue overflows.
 pub(crate) struct Inject<T: 'static> {
-    shared: Shared<T>,
-    synced: Mutex<Synced>,
+    /// True if the queue is closed.
+    is_closed: AtomicBool,
+    len: AtomicUsize,
+
+    pub(super) queue: MpscQueue<Header>,
+
+    _phantom: PhantomData<T>,
 }
+
+// trust me bro
+unsafe impl<T: 'static> Send for Inject<T> {}
+unsafe impl<T: 'static> Sync for Inject<T> {}
 
 impl<T: 'static> Inject<T> {
     pub(crate) fn new() -> Inject<T> {
-        let (shared, synced) = Shared::new();
+        // FIXME: leaks memory
+        let stub = unsafe {
+            let ptr = Box::into_raw(Box::new(Header::evil_unusable_dummy_header()));
+            #[cfg(miri)]
+            {
+                extern "Rust" {
+                    pub fn miri_static_root(ptr: *const u8);
+                }
 
+                unsafe {
+                    miri_static_root(ptr.cast::<u8>().cast_const());
+                }
+            }
+            RawTask::from_raw(NonNull::new_unchecked(ptr))
+        };
         Inject {
-            shared,
-            synced: Mutex::new(synced),
+            is_closed: AtomicBool::new(false),
+            len: AtomicUsize::new(0),
+            queue: MpscQueue::new_with_stub(stub),
+            _phantom: PhantomData,
         }
     }
 
     // Kind of annoying to have to include the cfg here
-    #[cfg(tokio_taskdump)]
     pub(crate) fn is_closed(&self) -> bool {
-        let synced = self.synced.lock();
-        self.shared.is_closed(&synced)
+        // TODO: ordering here?
+        self.is_closed.load(atomic::Ordering::Acquire)
     }
 
     /// Closes the injection queue, returns `true` if the queue is open when the
     /// transition is made.
     pub(crate) fn close(&self) -> bool {
-        let mut synced = self.synced.lock();
-        self.shared.close(&mut synced)
+        // TODO: ordering here?
+        !self.is_closed.swap(true, atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len.load(atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Pushes a value into the queue.
     ///
     /// This does nothing if the queue is closed.
     pub(crate) fn push(&self, task: task::Notified<T>) {
-        let mut synced = self.synced.lock();
-        // safety: passing correct `Synced`
-        unsafe { self.shared.push(&mut synced, task) }
+        self.len.fetch_add(1, atomic::Ordering::AcqRel);
+        self.queue.enqueue(task.into_raw());
     }
 
     pub(crate) fn pop(&self) -> Option<task::Notified<T>> {
-        if self.shared.is_empty() {
-            return None;
+        if let Some(item) = self.queue.dequeue() {
+            self.len.fetch_sub(1, atomic::Ordering::AcqRel);
+            Some(unsafe { task::Notified::from_raw(item) })
+        } else {
+            None
         }
+    }
 
-        let mut synced = self.synced.lock();
-        // safety: passing correct `Synced`
-        unsafe { self.shared.pop(&mut synced) }
+    pub(crate) fn pop_n(&self, n: usize) -> impl Iterator<Item = task::Notified<T>> + use<'_, T> {
+        PopN { queue: self, n }
     }
 }
+
+struct PopN<'a, T: 'static> {
+    queue: &'a Inject<T>,
+    n: usize,
+}
+
+impl<'a, T: 'static> Iterator for PopN<'a, T> {
+    type Item = task::Notified<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.n == 0 {
+            None
+        } else {
+            let item = self.queue.pop();
+            if item.is_some() {
+                self.n -= 1;
+            } else {
+                // Fuse the iterator.
+                self.n = 0;
+            }
+            item
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.n))
+    }
+}
+
+impl<'a, T: 'static> FusedIterator for PopN<'a, T> {}
